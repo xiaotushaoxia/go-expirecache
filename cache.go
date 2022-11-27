@@ -18,8 +18,8 @@ func NewCache(interval time.Duration) *Cache {
 }
 
 type Cache struct {
-	mp            map[string]*cacheItem
-	m             sync.RWMutex
+	mp map[string]*cacheItem
+	m  sync.RWMutex
 
 	lastClearTime *int64
 	clearInterval int64
@@ -44,38 +44,55 @@ func (c *Cache) Get(key string) (any, bool) {
 }
 
 func (c *Cache) Set(key string, v any, d time.Duration) {
-	defer c.clear()
 	c.m.Lock()
 	c.mp[key] = &cacheItem{
 		data:        v,
 		expiredTime: time.Now().Add(d).UnixNano(),
 	}
 	c.m.Unlock()
+	c.clear()
 }
 
 func (c *Cache) Delete(key string) {
-	defer c.clear()
 	c.m.Lock()
 	delete(c.mp, key)
 	c.m.Unlock()
+	c.clear()
 }
 
 func (c *Cache) Items() map[string]any {
 	mp := make(map[string]any)
-	var needDelete []string
-	now := current()
-	for s, t := range c.mp {
-		if now > t.expiredTime {
-			needDelete = append(needDelete, s)
-		} else {
-			mp[s] = t.data
+	now, ok := c.clearIntervalOK()
+
+	if !ok { // 上次清理还比较近 不清理
+		c.m.RLock()
+		for s, t := range c.mp {
+			if now < t.expiredTime {
+				mp[s] = t.data
+			}
 		}
+		c.m.RUnlock()
+	} else { // 上次清理比较远 清理
+		var needDelete []string
+		c.m.RLock()
+		for s, t := range c.mp {
+			if now < t.expiredTime {
+				mp[s] = t.data
+			} else {
+				needDelete = append(needDelete, s)
+			}
+		}
+		c.m.RUnlock()
+		c.deleteKeys(needDelete)
 	}
-	defer c.deleteKeys(needDelete)
+
 	return mp
 }
 
-func (c *Cache) deleteKeys(keys []string)  {
+func (c *Cache) deleteKeys(keys []string) {
+	if len(keys) == 0 {
+		return
+	}
 	go func() {
 		c.m.Lock()
 		for _, key := range keys {
@@ -86,11 +103,11 @@ func (c *Cache) deleteKeys(keys []string)  {
 }
 
 func (c *Cache) clear() {
-	now := current()
-	if now-atomic.LoadInt64(c.lastClearTime) < c.clearInterval {
+	now, ok := c.clearIntervalOK()
+	if !ok {
 		return
 	}
-	atomic.StoreInt64(c.lastClearTime, now)
+
 	go func() {
 		c.m.Lock()
 		defer c.m.Unlock()
@@ -106,13 +123,22 @@ func (c *Cache) clear() {
 	}()
 }
 
+func (c *Cache) clearIntervalOK() (int64, bool) {
+	now := current()
+	if now-atomic.LoadInt64(c.lastClearTime) < c.clearInterval {
+		return now, false
+	}
+	atomic.StoreInt64(c.lastClearTime, now)
+	return now, true
+}
+
 type cacheItem struct {
 	expiredTime int64
 	data        any
 }
 
 func (item *cacheItem) Expired() bool {
-	return current() > item.expiredTime
+	return current() >= item.expiredTime
 }
 
 func current() int64 {
